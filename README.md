@@ -3,6 +3,6 @@ C++ Paint System for Unreal Engine 5.4: dynamically paint materials on Static an
 
 
 
-https://github.com/user-attachments/assets/4ae51985-a772-4387-b413-9dd3f6062c18
 
+https://github.com/user-attachments/assets/6cd6eef6-3041-427f-9112-82b9a04e6600
 
