@@ -1,6 +1,9 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright (c) Victor Rivas Perez. All Rights Reserved.
 
 #include "PaintSystem.h"
+
 #include "Modules/ModuleManager.h"
 
-IMPLEMENT_PRIMARY_GAME_MODULE( FDefaultGameModuleImpl, PaintSystem, "PaintSystem" );
+DEFINE_LOG_CATEGORY(LogPaintSystem);
+
+IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, PaintSystem, "PaintSystem");

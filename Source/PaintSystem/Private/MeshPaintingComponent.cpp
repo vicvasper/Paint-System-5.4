@@ -1,378 +1,417 @@
+// Copyright (c) Victor Rivas Perez. All Rights Reserved.
+
 #include "MeshPaintingComponent.h"
 
-UMeshPaintingComponent::UMeshPaintingComponent()
-{
-    PrimaryComponentTick.bCanEverTick = true;
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/World.h"
+#include "PaintSystem.h"
+#include "Rendering/ColorVertexBuffer.h"
+#include "StaticMeshComponentLODInfo.h"
+#include "StaticMeshResources.h"
 
-    DefaultPaintRadius = 100.0f;
-    DefaultPaintStrength = 1.0f;
-    TimeSinceLastUpdate = 0.0f; // Para controlar la frecuencia de actualización del tick
-    UpdateInterval = 0.1f; // Actualizar cada 0.1 segundos
-    bIsUpdatingColors = false;
+namespace
+{
+	constexpr float DefaultPaintRadiusValue = 100.0f;
+	constexpr float DefaultPaintStrengthValue = 1.0f;
+	constexpr float DefaultFadeDuration = 5.0f;
+
+	/** Ten fade passes a second. Each rebuilds a vertex colour buffer, so this is not free. */
+	constexpr float DefaultFadeUpdateInterval = 0.1f;
+
+	/** Full intensity as an 8-bit colour component. */
+	constexpr float MaxChannelValue = 255.0f;
+
+	/** Maps a channel onto the FColor component holding it, without depending on byte order. */
+	constexpr uint8 FColor::* ChannelMembers[PaintChannelCount] =
+	{
+		&FColor::R,
+		&FColor::G,
+		&FColor::B,
+		&FColor::A,
+	};
 }
 
-void UMeshPaintingComponent::BeginPlay()
+UMeshPaintingComponent::UMeshPaintingComponent()
+	: DefaultPaintRadius(DefaultPaintRadiusValue)
+	, DefaultPaintStrength(DefaultPaintStrengthValue)
+	, FadeDuration(DefaultFadeDuration)
+	, FadeUpdateInterval(DefaultFadeUpdateInterval)
+	, TimeSinceLastFadeUpdate(0.0f)
 {
-    Super::BeginPlay();
+	PrimaryComponentTick.bCanEverTick = true;
 
-    // No necesitamos iniciar ningún temporizador aquí, ya que manejaremos el fade en TickComponent
+	// Nothing to fade until something is painted. Ticking is switched on by the first stroke
+	// and off again once the last contribution expires.
+	PrimaryComponentTick.bStartWithTickEnabled = false;
 }
 
 void UMeshPaintingComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    UpdateVertexGroupFades(DeltaTime);
-}
+	TimeSinceLastFadeUpdate += DeltaTime;
+	if (TimeSinceLastFadeUpdate < FadeUpdateInterval)
+	{
+		return;
+	}
 
-void UMeshPaintingComponent::StartPaintingIfNeeded(FVector StartPosition)
-{
-    if (!bIsPainting) // Solo crear un nuevo trazo si no estamos pintando
-    {
-        FPaintStroke NewStroke;
-        NewStroke.StartPosition = StartPosition;
-        NewStroke.PaintPositions.Add(StartPosition);  // Añadir la primera posición
-        ActivePaintStrokes.Add(NewStroke);  // Añadir el nuevo trazo a la lista de trazos activos
-        bIsPainting = true;  // Iniciar el estado de pintado
-    }
-    else
-    {
-        // Si ya estamos pintando, añadimos nuevas posiciones al último trazo
-        if (ActivePaintStrokes.Num() > 0)
-        {
-            FPaintStroke& CurrentStroke = ActivePaintStrokes.Last();
-            CurrentStroke.PaintPositions.Add(StartPosition);  // Añadir la nueva posición
-        }
-    }
-}
-
-void UMeshPaintingComponent::EndPainting(FVector EndPosition)
-{
-    if (bIsPainting && ActivePaintStrokes.Num() > 0)
-    {
-        FPaintStroke& CurrentStroke = ActivePaintStrokes.Last();
-        CurrentStroke.EndPosition = EndPosition;
-        bIsPainting = false;  // Finaliza el estado de pintado
-    }
+	TimeSinceLastFadeUpdate = 0.0f;
+	UpdateVertexGroupFades();
 }
 
 void UMeshPaintingComponent::PaintMaterial(
-    UPrimitiveComponent* MeshComp,
-    FVector HitLocation,
-    float PaintStrength,
-    float PaintRadius,
-    EMaterialChannel InChannel,
-    int32 LOD,
-    float PaintFalloff,
-    float EraseAfterSeconds,
-    bool bShouldFade,
-    float FadeSpeed)
+	UPrimitiveComponent* MeshComp,
+	FVector HitLocation,
+	float PaintStrength,
+	float PaintRadius,
+	EMaterialChannel InChannel,
+	int32 LOD,
+	float PaintFalloff,
+	float EraseAfterSeconds,
+	bool bShouldFade,
+	float FadeSpeed)
 {
-    // Actualizar el canal de pintura actual
-    Channel = InChannel;
+	UStaticMeshComponent* StaticMeshComp = Cast<UStaticMeshComponent>(MeshComp);
+	if (!StaticMeshComp)
+	{
+		UE_LOG(LogPaintSystem, Error, TEXT("PaintMaterial needs a UStaticMeshComponent."));
+		return;
+	}
 
-    // Verificar que MeshComp es válido
-    if (!MeshComp)
-    {
-        UE_LOG(LogTemp, Error, TEXT("MeshComp es nulo."));
-        return;
-    }
+	UStaticMesh* Mesh = StaticMeshComp->GetStaticMesh();
+	if (!Mesh || !Mesh->GetRenderData())
+	{
+		UE_LOG(LogPaintSystem, Error, TEXT("'%s' has no mesh or no render data."), *StaticMeshComp->GetName());
+		return;
+	}
 
-    UStaticMeshComponent* StaticMeshComp = Cast<UStaticMeshComponent>(MeshComp);
-    if (!StaticMeshComp || !StaticMeshComp->GetStaticMesh())
-    {
-        UE_LOG(LogTemp, Error, TEXT("StaticMeshComp o StaticMesh no son válidos."));
-        return;
-    }
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
 
-    if (!StaticMeshComp->GetStaticMesh()->GetRenderData())
-    {
-        UE_LOG(LogTemp, Error, TEXT("StaticMesh no tiene RenderData."));
-        return;
-    }
+	if (PaintRadius <= 0.0f)
+	{
+		PaintRadius = DefaultPaintRadius;
+	}
 
-    if (StaticMeshComp->LODData.Num() == 0)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("LODData es cero, configurando LODData..."));
-        StaticMeshComp->SetLODDataCount(1, StaticMeshComp->GetStaticMesh()->GetNumLODs());
-        if (StaticMeshComp->LODData.Num() == 0)
-        {
-            UE_LOG(LogTemp, Error, TEXT("No se pudo configurar LODData."));
-            return;
-        }
-    }
+	// Cheap rejection before touching the vertex buffer: a stroke that misses the mesh
+	// entirely should not cost a pass over its vertices.
+	const FBoxSphereBounds& MeshBounds = StaticMeshComp->Bounds;
+	if (FVector::DistSquared(MeshBounds.Origin, HitLocation) >
+		FMath::Square(MeshBounds.SphereRadius + PaintRadius))
+	{
+		return;
+	}
 
-    const FStaticMeshLODResources& LODModel = StaticMeshComp->GetStaticMesh()->GetRenderData()->LODResources[LOD];
-    const FPositionVertexBuffer* PositionVertexBuffer = &LODModel.VertexBuffers.PositionVertexBuffer;
+	const TIndirectArray<FStaticMeshLODResources>& LODResources = Mesh->GetRenderData()->LODResources;
+	if (!LODResources.IsValidIndex(LOD))
+	{
+		UE_LOG(LogPaintSystem, Error, TEXT("LOD %d is out of range on '%s' (%d LODs)."),
+			LOD, *Mesh->GetName(), LODResources.Num());
+		return;
+	}
 
-    const uint32 NumVertices = PositionVertexBuffer->GetNumVertices();
-    if (NumVertices == 0)
-    {
-        UE_LOG(LogTemp, Error, TEXT("Número de vértices es 0."));
-        return;
-    }
+	const FPositionVertexBuffer& PositionBuffer = LODResources[LOD].VertexBuffers.PositionVertexBuffer;
+	const int32 NumVertices = static_cast<int32>(PositionBuffer.GetNumVertices());
+	if (NumVertices == 0)
+	{
+		return;
+	}
 
-    FStaticMeshComponentLODInfo& LODInfo = StaticMeshComp->LODData[LOD];
+	if (StaticMeshComp->LODData.Num() <= LOD)
+	{
+		StaticMeshComp->SetLODDataCount(LOD + 1, Mesh->GetNumLODs());
+		if (StaticMeshComp->LODData.Num() <= LOD)
+		{
+			UE_LOG(LogPaintSystem, Error, TEXT("Could not allocate LOD data for LOD %d on '%s'."),
+				LOD, *StaticMeshComp->GetName());
+			return;
+		}
+	}
 
-    if (!LODInfo.OverrideVertexColors)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("OverrideVertexColors no es válido, inicializando con color negro."));
-        LODInfo.OverrideVertexColors = new FColorVertexBuffer;
-        LODInfo.OverrideVertexColors->InitFromSingleColor(FColor::Black, NumVertices);
-    }
+	FStaticMeshComponentLODInfo& LODInfo = StaticMeshComp->LODData[LOD];
+	if (!LODInfo.OverrideVertexColors)
+	{
+		LODInfo.OverrideVertexColors = new FColorVertexBuffer();
+		LODInfo.OverrideVertexColors->InitFromSingleColor(FColor::Black, NumVertices);
+		BeginInitResource(LODInfo.OverrideVertexColors);
+	}
 
-    TArray<FColor> CurrentColors;
-    LODInfo.OverrideVertexColors->GetVertexColors(CurrentColors);
+	TArray<FColor> Colors;
+	LODInfo.OverrideVertexColors->GetVertexColors(Colors);
+	if (Colors.Num() != NumVertices)
+	{
+		UE_LOG(LogPaintSystem, Error,
+			TEXT("Override colour count (%d) does not match the vertex count (%d) on '%s'."),
+			Colors.Num(), NumVertices, *StaticMeshComp->GetName());
+		return;
+	}
 
-    if (CurrentColors.Num() != NumVertices)
-    {
-        UE_LOG(LogTemp, Error, TEXT("Número de colores en CurrentColors no coincide con el número de vértices."));
-        return;
-    }
+	FMeshPaintState& PaintState = MeshPaintStates.FindOrAdd(StaticMeshComp);
+	PaintState.LODIndex = LOD;
 
-    // Array temporal para almacenar los vértices pintados
-    TArray<uint32> PaintedVertexGroup;
+	// Hoisted: the transform was fetched once per vertex.
+	const FTransform ComponentTransform = StaticMeshComp->GetComponentTransform();
+	const float PaintRadiusSquared = FMath::Square(PaintRadius);
+	const float CurrentTime = World->GetTimeSeconds();
 
-    // Obtener o crear el mapa de contribuciones para este MeshComp
-    TMap<uint32, TArray<FVertexPaintContribution>>& VertexContributions = MeshVertexContributions.FindOrAdd(StaticMeshComp);
+	const int32 ChannelIndex = static_cast<int32>(InChannel);
+	if (!ChannelMembers[ChannelIndex])
+	{
+		return;
+	}
 
-    for (int32 VertexIndex = 0; VertexIndex < static_cast<int32>(NumVertices); ++VertexIndex)
-    {
-        // Obtener la posición local del vértice como FVector3f
-        FVector3f VertexPositionLocal = PositionVertexBuffer->VertexPosition(VertexIndex);
+	int32 PaintedVertexCount = 0;
+	bool bColorsChanged = false;
 
-        // Convertir a FVector (double) para usar en TransformPosition
-        FVector VertexPosition = FVector(VertexPositionLocal);
+	for (int32 VertexIndex = 0; VertexIndex < NumVertices; ++VertexIndex)
+	{
+		const FVector VertexWorldPosition =
+			ComponentTransform.TransformPosition(FVector(PositionBuffer.VertexPosition(VertexIndex)));
 
-        // Transformar la posición del vértice a espacio mundial
-        VertexPosition = StaticMeshComp->GetComponentTransform().TransformPosition(VertexPosition);
+		// Squared comparison: the exact distance is only needed for the falloff, which is
+		// skipped for the vertices that fail this test - the majority, for a typical brush.
+		const float DistanceSquared = FVector::DistSquared(VertexWorldPosition, HitLocation);
+		if (DistanceSquared > PaintRadiusSquared)
+		{
+			continue;
+		}
 
-        float Distance = FVector::Dist(VertexPosition, HitLocation);
+		const float FalloffFactor = FMath::Clamp(1.0f - (FMath::Sqrt(DistanceSquared) / PaintRadius), 0.0f, 1.0f);
+		const float FinalPaintStrength = PaintStrength * FMath::Pow(FalloffFactor, PaintFalloff);
+		if (FinalPaintStrength <= 0.0f)
+		{
+			continue;
+		}
 
-        float FalloffFactor = FMath::Clamp(1.0f - (Distance / PaintRadius), 0.0f, 1.0f);
-        float FinalPaintStrength = PaintStrength * FMath::Pow(FalloffFactor, PaintFalloff);
+		FVertexPaintContribution Contribution;
+		Contribution.InitialIntensity = FinalPaintStrength;
+		Contribution.TimePainted = CurrentTime;
+		Contribution.EraseAfterSeconds = EraseAfterSeconds > 0.0f ? EraseAfterSeconds : FadeDuration;
+		Contribution.Channel = InChannel;
 
-        if (Distance <= PaintRadius && FinalPaintStrength > 0.0f)
-        {
-            PaintedVertexGroup.Add(VertexIndex);
+		// bShouldFade was accepted and ignored. A non-positive fade speed now means the
+		// deposit is permanent, which is what the flag was presumably for.
+		Contribution.FadeSpeed = (bShouldFade && FadeSpeed > 0.0f) ? FadeSpeed : 0.0f;
 
-            // Crear una nueva contribución de pintura
-            FVertexPaintContribution NewContribution;
-            NewContribution.InitialIntensity = FinalPaintStrength; // Valor entre 0.0f y 1.0f
-            NewContribution.TimePainted = GetWorld()->GetTimeSeconds();
-            NewContribution.EraseAfterSeconds = EraseAfterSeconds > 0.0f ? EraseAfterSeconds : FadeDuration;
-            NewContribution.FadeSpeed = FadeSpeed > 0.0f ? FadeSpeed : 1.0f;
+		FVertexPaintData& VertexData = PaintState.Vertices.FindOrAdd(VertexIndex);
+		VertexData.Contributions.Add(Contribution);
+		VertexData.TouchedChannelMask |= static_cast<uint8>(1 << ChannelIndex);
 
-            // Agregar la contribución al vértice
-            VertexContributions.FindOrAdd(VertexIndex).Add(NewContribution);
+		bColorsChanged |= RecomputeVertexColor(VertexData, CurrentTime, Colors[VertexIndex]);
+		++PaintedVertexCount;
+	}
 
-            // Calcular la intensidad total actual del vértice sumando todas las contribuciones
-            float TotalIntensity = 0.0f;
-            for (const FVertexPaintContribution& Contribution : VertexContributions[VertexIndex])
-            {
-                TotalIntensity += Contribution.InitialIntensity;
-            }
+	if (PaintedVertexCount == 0)
+	{
+		return;
+	}
 
-            // Clampear la intensidad total
-            TotalIntensity = FMath::Clamp(TotalIntensity, 0.0f, 1.0f);
+	if (bColorsChanged)
+	{
+		UploadVertexColors(*StaticMeshComp, LOD, Colors);
+	}
 
-            // Actualizar el color del vértice
-            FColor& VertexColor = CurrentColors[VertexIndex];
-            uint8 ColorValue = static_cast<uint8>(TotalIntensity * 255.0f);
+	UpdateTickEnabled();
 
-            switch (Channel)
-            {
-            case EMaterialChannel::Red:
-                VertexColor.R = ColorValue;
-                break;
-            case EMaterialChannel::Green:
-                VertexColor.G = ColorValue;
-                break;
-            case EMaterialChannel::Blue:
-                VertexColor.B = ColorValue;
-                break;
-            case EMaterialChannel::Alpha:
-                VertexColor.A = ColorValue;
-                break;
-            }
-        }
-    }
-
-    if (PaintedVertexGroup.Num() == 0)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("No se pintaron vértices en este ciclo."));
-        return;
-    }
-
-    // Aplicar los cambios a los colores de los vértices
-    LODInfo.OverrideVertexColors->InitFromColorArray(CurrentColors);
-    BeginReleaseResource(LODInfo.OverrideVertexColors);
-    FlushRenderingCommands();
-    BeginInitResource(LODInfo.OverrideVertexColors);
-    StaticMeshComp->MarkRenderStateDirty();
+	UE_LOG(LogPaintSystem, Verbose, TEXT("Painted %d of %d vertices on '%s'."),
+		PaintedVertexCount, NumVertices, *StaticMeshComp->GetName());
 }
 
-void UMeshPaintingComponent::UpdateVertexGroupFades(float DeltaTime)
+void UMeshPaintingComponent::UpdateVertexGroupFades()
 {
-    if (MeshVertexContributions.Num() == 0)
-    {
-        return;
-    }
+	const UWorld* World = GetWorld();
+	if (!World || MeshPaintStates.Num() == 0)
+	{
+		return;
+	}
 
-    float CurrentTime = GetWorld()->GetTimeSeconds();
+	const float CurrentTime = World->GetTimeSeconds();
 
-    // Lista para almacenar MeshComps que deben ser eliminados
-    TArray<UStaticMeshComponent*> MeshCompsToRemove;
+	for (auto MeshIt = MeshPaintStates.CreateIterator(); MeshIt; ++MeshIt)
+	{
+		UStaticMeshComponent* MeshComp = MeshIt.Key().Get();
+		FMeshPaintState& PaintState = MeshIt.Value();
 
-    for (auto& MeshPair : MeshVertexContributions)
-    {
-        UStaticMeshComponent* MeshComp = MeshPair.Key;
-        TMap<uint32, TArray<FVertexPaintContribution>>& VertexContributions = MeshPair.Value;
+		// A null weak pointer means the component is gone. The previous version stored raw
+		// pointers here and read through them.
+		if (!MeshComp || !MeshComp->LODData.IsValidIndex(PaintState.LODIndex))
+		{
+			MeshIt.RemoveCurrent();
+			continue;
+		}
 
-        if (!MeshComp || MeshComp->LODData.Num() == 0)
-        {
-            MeshCompsToRemove.Add(MeshComp);
-            continue;
-        }
+		FStaticMeshComponentLODInfo& LODInfo = MeshComp->LODData[PaintState.LODIndex];
+		if (!LODInfo.OverrideVertexColors || !LODInfo.OverrideVertexColors->IsInitialized())
+		{
+			MeshIt.RemoveCurrent();
+			continue;
+		}
 
-        FStaticMeshComponentLODInfo& LODInfo = MeshComp->LODData[0];
-        if (!LODInfo.OverrideVertexColors || !LODInfo.OverrideVertexColors->IsInitialized())
-        {
-            MeshCompsToRemove.Add(MeshComp);
-            continue;
-        }
+		TArray<FColor> Colors;
+		LODInfo.OverrideVertexColors->GetVertexColors(Colors);
 
-        TArray<FColor> CurrentColors;
-        LODInfo.OverrideVertexColors->GetVertexColors(CurrentColors);
+		bool bColorsChanged = false;
 
-        bool bModifiedColors = false;
+		for (auto VertexIt = PaintState.Vertices.CreateIterator(); VertexIt; ++VertexIt)
+		{
+			const uint32 VertexIndex = VertexIt.Key();
+			if (!Colors.IsValidIndex(static_cast<int32>(VertexIndex)))
+			{
+				VertexIt.RemoveCurrent();
+				continue;
+			}
 
-        // Lista para almacenar índices de vértices que deben ser eliminados
-        TArray<uint32> VerticesToRemove;
+			FVertexPaintData& VertexData = VertexIt.Value();
+			bColorsChanged |= RecomputeVertexColor(VertexData, CurrentTime, Colors[VertexIndex]);
 
-        for (auto& VertexPair : VertexContributions)
-        {
-            uint32 VertexIndex = VertexPair.Key;
-            TArray<FVertexPaintContribution>& Contributions = VertexPair.Value;
+			// Dropped only after the recompute has written its channels back to zero.
+			if (VertexData.Contributions.Num() == 0)
+			{
+				VertexIt.RemoveCurrent();
+			}
+		}
 
-            if (VertexIndex >= static_cast<uint32>(CurrentColors.Num()))
-            {
-                VerticesToRemove.Add(VertexIndex);
-                continue;
-            }
+		// Re-uploading is the expensive part, so it happens only when a colour actually
+		// changed - not, as before, whenever any vertex still had contributions.
+		if (bColorsChanged)
+		{
+			UploadVertexColors(*MeshComp, PaintState.LODIndex, Colors);
+		}
 
-            float TotalIntensity = 0.0f;
+		if (PaintState.Vertices.Num() == 0)
+		{
+			MeshIt.RemoveCurrent();
+		}
+	}
 
-            // Lista para almacenar índices de contribuciones que deben ser eliminadas
-            TArray<int32> ContributionsToRemove;
-
-            for (int32 i = Contributions.Num() - 1; i >= 0; --i)
-            {
-                FVertexPaintContribution& Contribution = Contributions[i];
-
-                float TimeSincePainted = CurrentTime - Contribution.TimePainted;
-                float FadeProgress = 0.0f;
-
-                if (TimeSincePainted >= Contribution.EraseAfterSeconds)
-                {
-                    FadeProgress = (TimeSincePainted - Contribution.EraseAfterSeconds) / Contribution.FadeSpeed;
-                    FadeProgress = FMath::Clamp(FadeProgress, 0.0f, 1.0f);
-                }
-
-                float RemainingIntensity = Contribution.InitialIntensity * (1.0f - FadeProgress);
-
-                // Si la intensidad restante es muy pequeña, marcar para eliminar
-                if (RemainingIntensity <= KINDA_SMALL_NUMBER)
-                {
-                    Contributions.RemoveAt(i);
-                    continue;
-                }
-                TotalIntensity += RemainingIntensity;
-            }
-
-            // Eliminar las contribuciones marcadas
-            for (int32 IndexToRemove : ContributionsToRemove)
-            {
-                Contributions.RemoveAt(IndexToRemove);
-            }
-
-            // Si ya no hay contribuciones, marcar el vértice para eliminar
-            if (Contributions.Num() == 0)
-            {
-                VerticesToRemove.Add(VertexIndex);
-            }
-
-            // Clampear la intensidad total
-            TotalIntensity = FMath::Clamp(TotalIntensity, 0.0f, 1.0f);
-
-            // Si la intensidad total es muy pequeña, establecerla en cero
-            if (TotalIntensity <= KINDA_SMALL_NUMBER)
-            {
-                TotalIntensity = 0.0f;
-            }
-
-            // Actualizar el color del vértice
-            FColor& VertexColor = CurrentColors[VertexIndex];
-            uint8 ColorValue = static_cast<uint8>(TotalIntensity * 255.0f);
-
-            switch (Channel)
-            {
-            case EMaterialChannel::Red:
-                VertexColor.R = ColorValue;
-                break;
-            case EMaterialChannel::Green:
-                VertexColor.G = ColorValue;
-                break;
-            case EMaterialChannel::Blue:
-                VertexColor.B = ColorValue;
-                break;
-            case EMaterialChannel::Alpha:
-                VertexColor.A = ColorValue;
-                break;
-            }
-
-            bModifiedColors = true;
-        }
-
-        // Eliminar los vértices marcados
-        for (uint32 VertexIndexToRemove : VerticesToRemove)
-        {
-            VertexContributions.Remove(VertexIndexToRemove);
-        }
-
-        if (bModifiedColors)
-        {
-            // Aplicar los cambios a los colores de los vértices
-            LODInfo.OverrideVertexColors->InitFromColorArray(CurrentColors);
-            BeginReleaseResource(LODInfo.OverrideVertexColors);
-            FlushRenderingCommands();
-            BeginInitResource(LODInfo.OverrideVertexColors);
-            MeshComp->MarkRenderStateDirty();
-        }
-
-        // Si ya no hay vértices con contribuciones, marcar el MeshComp para eliminar
-        if (VertexContributions.Num() == 0)
-        {
-            MeshCompsToRemove.Add(MeshComp);
-        }
-    }
-
-    // Eliminar los MeshComps marcados
-    for (UStaticMeshComponent* MeshCompToRemove : MeshCompsToRemove)
-    {
-        MeshVertexContributions.Remove(MeshCompToRemove);
-    }
+	UpdateTickEnabled();
 }
 
+bool UMeshPaintingComponent::RecomputeVertexColor(FVertexPaintData& VertexData, float CurrentTime, FColor& OutColor) const
+{
+	float ChannelIntensity[PaintChannelCount] = {};
 
+	// Reverse iteration so expired contributions can be dropped in place.
+	for (int32 Index = VertexData.Contributions.Num() - 1; Index >= 0; --Index)
+	{
+		const FVertexPaintContribution& Contribution = VertexData.Contributions[Index];
 
+		float FadeProgress = 0.0f;
+		if (Contribution.FadeSpeed > 0.0f)
+		{
+			const float TimeSincePainted = CurrentTime - Contribution.TimePainted;
+			if (TimeSincePainted >= Contribution.EraseAfterSeconds)
+			{
+				FadeProgress = FMath::Clamp(
+					(TimeSincePainted - Contribution.EraseAfterSeconds) / Contribution.FadeSpeed, 0.0f, 1.0f);
+			}
+		}
 
+		const float RemainingIntensity = Contribution.InitialIntensity * (1.0f - FadeProgress);
+		if (RemainingIntensity <= KINDA_SMALL_NUMBER)
+		{
+			// Swap-remove is safe here: the element moved into this slot comes from the tail,
+			// which the reverse walk has already visited.
+			VertexData.Contributions.RemoveAtSwap(Index);
+			continue;
+		}
 
+		ChannelIntensity[static_cast<int32>(Contribution.Channel)] += RemainingIntensity;
+	}
 
+	bool bChanged = false;
 
+	for (int32 ChannelIndex = 0; ChannelIndex < PaintChannelCount; ++ChannelIndex)
+	{
+		// Channels this vertex was never painted in are left untouched. Zeroing them all would
+		// clear the buffer's initial opaque alpha.
+		if ((VertexData.TouchedChannelMask & (1 << ChannelIndex)) == 0)
+		{
+			continue;
+		}
 
+		const float Intensity = FMath::Clamp(ChannelIntensity[ChannelIndex], 0.0f, 1.0f);
+		const uint8 NewValue = static_cast<uint8>(Intensity * MaxChannelValue);
 
+		uint8 FColor::* const Member = ChannelMembers[ChannelIndex];
+		if (OutColor.*Member != NewValue)
+		{
+			OutColor.*Member = NewValue;
+			bChanged = true;
+		}
+	}
 
+	return bChanged;
+}
 
+void UMeshPaintingComponent::UploadVertexColors(UStaticMeshComponent& MeshComp, int32 LODIndex, const TArray<FColor>& Colors)
+{
+	FStaticMeshComponentLODInfo& LODInfo = MeshComp.LODData[LODIndex];
+	if (!LODInfo.OverrideVertexColors)
+	{
+		return;
+	}
 
+	// Release, flush, rewrite, re-init - in that order. The previous version rewrote the
+	// buffer's contents first and released it afterwards, mutating memory the render thread
+	// could still have been reading.
+	BeginReleaseResource(LODInfo.OverrideVertexColors);
+	FlushRenderingCommands();
 
+	LODInfo.OverrideVertexColors->InitFromColorArray(Colors);
+
+	BeginInitResource(LODInfo.OverrideVertexColors);
+	MeshComp.MarkRenderStateDirty();
+}
+
+void UMeshPaintingComponent::ClearAllPaint()
+{
+	for (auto& MeshPair : MeshPaintStates)
+	{
+		UStaticMeshComponent* MeshComp = MeshPair.Key.Get();
+		if (!MeshComp || !MeshComp->LODData.IsValidIndex(MeshPair.Value.LODIndex))
+		{
+			continue;
+		}
+
+		FStaticMeshComponentLODInfo& LODInfo = MeshComp->LODData[MeshPair.Value.LODIndex];
+		if (!LODInfo.OverrideVertexColors)
+		{
+			continue;
+		}
+
+		TArray<FColor> Colors;
+		LODInfo.OverrideVertexColors->GetVertexColors(Colors);
+
+		for (const TPair<uint32, FVertexPaintData>& VertexPair : MeshPair.Value.Vertices)
+		{
+			if (!Colors.IsValidIndex(static_cast<int32>(VertexPair.Key)))
+			{
+				continue;
+			}
+
+			for (int32 ChannelIndex = 0; ChannelIndex < PaintChannelCount; ++ChannelIndex)
+			{
+				if (VertexPair.Value.TouchedChannelMask & (1 << ChannelIndex))
+				{
+					Colors[VertexPair.Key].*ChannelMembers[ChannelIndex] = 0;
+				}
+			}
+		}
+
+		UploadVertexColors(*MeshComp, MeshPair.Value.LODIndex, Colors);
+	}
+
+	MeshPaintStates.Empty();
+	UpdateTickEnabled();
+}
+
+void UMeshPaintingComponent::UpdateTickEnabled()
+{
+	// Idle components cost nothing: with no paint left there is nothing to fade.
+	SetComponentTickEnabled(MeshPaintStates.Num() > 0);
+}
